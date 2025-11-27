@@ -117,7 +117,7 @@ def extract_boundary(
 
     # Construct output file path
     safe_country = country_name.replace(" ", "_")
-    output_path = output_dir / f"{safe_country}_boundary.geojson"
+    output_path = output_dir / f"{safe_country}.geojson"
 
     logging.info("Saving boundary to '%s'.", output_path)
     gdf_country.to_file(output_path, driver="GeoJSON")

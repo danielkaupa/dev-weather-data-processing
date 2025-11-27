@@ -1,7 +1,7 @@
 {
   "dataset_prefix": "era5-world",
-  "region_token": "INDIA",
-  "boundary_file": "geoBoundariesCGAZ_ADM0/India.geojson",
+  "region_token": "INDIA_BOUNDARY",
+  "boundary_file": "geoBoundariesCGAZ_ADM0/India_boundary.geojson",
   "inclusion_mode": "centroid",
   "fraction_threshold": 0.9,
   "exclusion_bboxes": [
@@ -21,5 +21,5 @@
     }
   ],
   "row_count": 4442,
-  "generated_at": "2025-11-27T18:54:06Z"
+  "generated_at": "2025-11-27T18:47:16Z"
 }
