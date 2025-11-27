@@ -24,5 +24,7 @@
     }
   ],
   "row_count": 4220,
-  "generated_at": "2025-11-27T00:50:47Z"
+  "parallel_backend": "processpool",
+  "max_workers": 8,
+  "generated_at": "2025-11-27T01:03:04Z"
 }

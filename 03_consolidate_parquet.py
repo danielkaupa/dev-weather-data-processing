@@ -14,6 +14,7 @@ Features:
 
 from __future__ import annotations
 
+from importlib.resources import files
 from pathlib import Path
 import logging
 import re
@@ -23,7 +24,6 @@ from dataclasses import dataclass
 import time
 import polars as pl
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
 
 # Optional MPI
 try:
@@ -55,6 +55,10 @@ MAX_WORKERS = max(int(multiprocessing.cpu_count() * 2 / 3), 2)
 OVERWRITE = False
 LOG_LEVEL = logging.INFO
 
+# COUNTRY TOKEN (match Script 02)
+COUNTRY_TOKEN = "INDIA"   # e.g. "INDIA", "FRANCE", "USA", "BRAZIL"
+
+
 
 # ---------------------------------------------------------------------
 # LOGGING
@@ -73,14 +77,39 @@ def setup_logging():
 # ---------------------------------------------------------------------
 
 FILE_RE = re.compile(
-    r".*_INDIA_(?P<uid>[A-Za-z0-9]+)_(?P<year>\d{4})_(?P<month>\d{2})\.parquet$"
+    fr".*_{COUNTRY_TOKEN}_(?P<uid>[A-Za-z0-9]+)_(?P<year>\d{{4}})_(?P<month>\d{{2}})\.parquet$"
 )
+
 
 def parse_year_month(path: Path):
     m = FILE_RE.match(path.name)
     if not m:
         raise ValueError(f"Filename pattern not recognized: {path.name}")
     return int(m.group("year")), int(m.group("month")), m.group("uid")
+
+
+def parse_prefix_uid_year_month(path: Path):
+    """
+    Extract dataset prefix, UID, year, month from filenames like:
+      era5-world_N37W68S6E98_d514a3a3c256_2024_02.parquet
+    """
+    m = re.match(
+        r"^(?P<prefix>[^_]+_[^_]+)_"          # era5-world_N37W68S6E98
+        r"(?P<uid>[A-Za-z0-9]+)_"             # d514a3a3c256
+        r"(?P<year>\d{4})_"
+        r"(?P<month>\d{2})\.parquet$",
+        path.name
+    )
+    if not m:
+        raise ValueError(f"Filename not recognized: {path.name}")
+
+    return (
+        m.group("prefix"),    # "era5-world_N37W68S6E98"
+        m.group("uid"),       # "d514a3a3c256"
+        int(m.group("year")),
+        int(m.group("month")),
+    )
+
 
 
 # ---------------------------------------------------------------------
@@ -107,22 +136,43 @@ class YearStats:
 # DISCOVER FILES
 # ---------------------------------------------------------------------
 
-def load_monthly_files() -> Dict[int, List[Path]]:
+def load_monthly_files() -> Dict[int, Dict]:
+    """
+    Returns:
+    {
+        2018: {
+            "prefix": "...",
+            "uid": "...",
+            "files": [Path, Path, Path]
+        },
+        ...
+    }
+    """
     files = sorted(INTERIM_DIR.glob("*INDIA*.parquet"))
 
-    by_year: Dict[int, List[Path]] = {}
+    by_year: Dict[int, Dict] = {}
+
     for f in files:
         try:
-            year, month, uid = parse_year_month(f)
+            prefix, uid, year, month = parse_prefix_uid_year_month(f)
         except Exception:
             logging.warning("Skipping unrecognized file: %s", f.name)
             continue
 
-        by_year.setdefault(year, []).append((month, f))
+        if year not in by_year:
+            by_year[year] = {
+                "prefix": prefix,
+                "uid": uid,
+                "files": []
+            }
+
+        by_year[year]["files"].append((month, f))
 
     # sort by month
     for year in by_year:
-        by_year[year] = [f for (_, f) in sorted(by_year[year], key=lambda x: x[0])]
+        by_year[year]["files"] = [
+            f for (_, f) in sorted(by_year[year]["files"], key=lambda x: x[0])
+        ]
 
     logging.info("Found %d years of data.", len(by_year))
     return by_year
@@ -132,20 +182,36 @@ def load_monthly_files() -> Dict[int, List[Path]]:
 # COLUMN NORMALISATION
 # ---------------------------------------------------------------------
 
-def get_all_columns(files: List[Path]) -> Set[str]:
-    all_cols: Set[str] = set()
+def get_all_columns(files: List[Path]) -> Dict[str, pl.DataType]:
+    all_cols: Dict[str, pl.DataType] = {}
     for f in files:
         schema = pl.scan_parquet(f).collect_schema()
-        for c in schema.names():
-            all_cols.add(c)
+        for name, dtype in schema.items():
+            # promote Float32 → Float64 globally
+            if dtype == pl.Float32:
+                dtype = pl.Float64
+            all_cols[name] = dtype
     return all_cols
 
 
-def normalize(df: pl.DataFrame, all_cols: Set[str]) -> pl.DataFrame:
-    missing = all_cols - set(df.columns)
+
+def normalize(df: pl.DataFrame, all_cols: Dict[str, pl.DataType]) -> pl.DataFrame:
+    # Add missing columns
+    missing = set(all_cols) - set(df.columns)
     for col in missing:
-        df = df.with_columns(pl.lit(None).alias(col))
-    return df.select(sorted(all_cols))
+        df = df.with_columns(pl.lit(None).cast(all_cols[col]).alias(col))
+
+    # Cast existing columns to expected dtype
+    casts = []
+    for col, dtype in all_cols.items():
+        if col in df.columns and df.schema[col] != dtype:
+            casts.append(pl.col(col).cast(dtype).alias(col))
+
+    if casts:
+        df = df.with_columns(casts)
+
+    return df.select(sorted(all_cols.keys()))
+
 
 
 # ---------------------------------------------------------------------
@@ -177,32 +243,41 @@ def group_files(files: List[Path], mode: str):
 # WORKER — PROCESS A SINGLE YEAR
 # ---------------------------------------------------------------------
 
-def process_year_worker(year: int, files: List[Path],
-                        modes: List[str], overwrite: bool):
+def process_year_worker(year: int, info: Dict, modes: List[str], overwrite: bool):
+    prefix = info["prefix"]
+    uid = info["uid"]
+    files = info["files"]    # must be List[Path]
+
     logging.basicConfig(
         level=LOG_LEVEL,
         format=f"%(asctime)s [%(levelname)s] [Year={year}] %(message)s",
     )
+    logging.info(f"Starting consolidation for year {year} ({len(files)} files)")
+
 
     stats_for_year: List[YearStats] = []
+
+    # Determine union schema across all monthly files
     all_cols = get_all_columns(files)
-    uid = parse_year_month(files[0])[2]
 
     for mode in modes:
         mode_stats = YearStats(year=year, mode=mode, outputs=[])
 
+        # group into annual / biannual / quarterly
         for idx, group in enumerate(group_files(files, mode), start=1):
             if not group:
                 continue
 
-            # Output name
+            # build filename
             if mode == "annual":
-                out_name = f"era5_INDIA_{uid}_{year}.parquet"
+                out_name = f"{prefix}_{uid}_{year}.parquet"
+
             elif mode == "biannual":
                 half = "H1" if idx == 1 else "H2"
-                out_name = f"era5_INDIA_{uid}_{year}_{half}.parquet"
-            else:
-                out_name = f"era5_INDIA_{uid}_{year}_Q{idx}.parquet"
+                out_name = f"{prefix}_{uid}_{year}_{half}.parquet"
+
+            elif mode == "quarterly":
+                out_name = f"{prefix}_{uid}_{year}_Q{idx}.parquet"
 
             out_path = OUTPUT_DIR / out_name
 
@@ -212,6 +287,7 @@ def process_year_worker(year: int, files: List[Path],
             start_wall = time.time()
             start_cpu = time.process_time()
 
+            # Load + normalise all monthly files
             dfs = []
             for f in group:
                 df = pl.read_parquet(f)
@@ -220,6 +296,7 @@ def process_year_worker(year: int, files: List[Path],
 
             combined = pl.concat(dfs, how="vertical")
             combined.write_parquet(out_path, compression="snappy")
+            logging.info(f"Wrote {out_path} ({combined.height} rows)")
 
             cpu_elapsed = time.process_time() - start_cpu
             wall_elapsed = time.time() - start_wall
@@ -230,7 +307,7 @@ def process_year_worker(year: int, files: List[Path],
                     n_input_files=len(group),
                     cpu_time_sec=cpu_elapsed,
                     wall_time_sec=wall_elapsed,
-                    row_count=combined.height
+                    row_count=combined.height,
                 )
             )
 
@@ -239,11 +316,13 @@ def process_year_worker(year: int, files: List[Path],
     return stats_for_year
 
 
+
 # ---------------------------------------------------------------------
 # MAIN — PROCESSPOOL BACKEND
 # ---------------------------------------------------------------------
 
 def run_processpool(year_files, modes, overwrite):
+    from concurrent.futures import ProcessPoolExecutor  # ← ADD THIS
     results = []
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [
@@ -253,6 +332,7 @@ def run_processpool(year_files, modes, overwrite):
         for f in futures:
             results.extend(f.result())
     return results
+
 
 
 # ---------------------------------------------------------------------
@@ -327,10 +407,16 @@ def consolidate():
 
     # Per-year detail
     for ys in all_stats:
+        logging.info("-----------------------------------------------")
         logging.info("YEAR %d — MODE: %s", ys.year, ys.mode)
+
+        if not ys.outputs:
+            logging.info("  (no output files for this year/mode)")
+            continue
+
         for out in ys.outputs:
             logging.info(
-                "  %-36s  files=%d  rows=%d  CPU=%.2f  WALL=%.2f",
+                "  WROTE %-40s | files=%2d | rows=%8d | CPU=%.2fs | WALL=%.2fs",
                 out.output_name,
                 out.n_input_files,
                 out.row_count,
