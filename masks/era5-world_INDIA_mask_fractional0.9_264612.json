@@ -1,0 +1,28 @@
+{
+  "dataset_prefix": "era5-world",
+  "country_token": "INDIA",
+  "boundary_path": "geoBoundariesCGAZ_ADM0/geoBoundariesCGAZ_ADM0.shp",
+  "adm_level": 0,
+  "country_name": "India",
+  "inclusion_mode": "fractional",
+  "fraction_threshold": 0.9,
+  "apply_exclusions": true,
+  "exclusion_bboxes": [
+    {
+      "name": "andaman_nicobar",
+      "lon_min": 90.0,
+      "lon_max": 95.0,
+      "lat_min": -10.0,
+      "lat_max": 15.0
+    },
+    {
+      "name": "lakshadweep",
+      "lon_min": 71.0,
+      "lon_max": 74.0,
+      "lat_min": 8.2,
+      "lat_max": 11.7
+    }
+  ],
+  "row_count": 4220,
+  "generated_at": "2025-11-27T00:02:15Z"
+}
