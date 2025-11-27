@@ -1140,7 +1140,7 @@ def main() -> None:
 
     # --- 8. Optional preview plot -----------------------------------
     if GENERATE_PREVIEW_PNG:
-        from visualise_masks import preview_mask
+        from step2_visualise_masks import preview_mask
 
         preview_png_path = mask_path.with_suffix(".png")
         preview_mask(

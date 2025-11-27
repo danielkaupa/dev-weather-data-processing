@@ -34,19 +34,32 @@ def compute_memory_usage(df: pl.DataFrame, col: str):
 def summarize_column(df: pl.DataFrame, col: str):
     s = df[col]
     dtype = s.dtype
+    n_rows = len(df)
+
+    # ----- Unique values -----
+    try:
+        unique_count = s.n_unique()
+    except Exception:
+        unique_count = None
+
+    unique_pct = (unique_count / n_rows * 100) if (unique_count is not None and n_rows > 0) else None
 
     summary = {
         "column": col,
         "dtype": str(dtype),
         "memory_bytes": compute_memory_usage(df, col),
-        "null_pct": float(s.null_count() / len(df) * 100) if len(df) else 0,
+        "null_pct": float(s.null_count() / n_rows * 100) if n_rows else 0,
         "sample_values": safe_sample(df, col),
+        "unique_count": unique_count,
+        "unique_pct": unique_pct,
     }
 
     # Numeric summary
-    if dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                 pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-                 pl.Float32, pl.Float64):
+    if dtype in (
+        pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+        pl.Float32, pl.Float64
+    ):
         summary["min"] = s.min()
         summary["max"] = s.max()
         summary["mean"] = s.mean()
@@ -87,6 +100,9 @@ def profile_file(path: Path) -> str:
         report_lines.append(f"  dtype           : {info['dtype']}")
         report_lines.append(f"  memory (bytes)  : {info['memory_bytes']:,}")
         report_lines.append(f"  null %          : {info['null_pct']:.2f}%")
+        report_lines.append(f"  unique values   : {info['unique_count']}")
+        if info["unique_pct"] is not None:
+            report_lines.append(f"  unique %        : {info['unique_pct']:.2f}%")
         report_lines.append(f"  sample values   : {info['sample_values']}")
 
         # Numeric stats
