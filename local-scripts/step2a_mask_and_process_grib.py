@@ -65,23 +65,14 @@ from eccodes import (
     CodesInternalError,
 )
 
-# Optional MPI backend (with rank globals)
+# Optional MPI backend
 try:
-    from mpi4py import MPI  # type: ignore[attr-defined]
-
-    COMM = MPI.COMM_WORLD
-    RANK = COMM.Get_rank()
-    SIZE = COMM.Get_size()
-    MPI_ENABLED = True
-except Exception:  # noqa: BLE001
+    from mpi4py import MPI
+except Exception:
     MPI = None
-    COMM = None
-    RANK = 0
-    SIZE = 1
-    MPI_ENABLED = False
 
 # ======================================================================
-# Global configuration options (hardcode - defaults, overridden via CLI)
+# Global configuration options (hardcode - no argparse)
 # ======================================================================
 
 GRIB_DIR = Path("../data/raw/")
@@ -89,8 +80,13 @@ MASK_META = Path("masks/mask_metadata/era5-world_INDIA_mask_centroid_264612.json
 MASK_PARQUET = Path("masks/era5-world_INDIA_mask_centroid_264612.parquet")
 OUTPUT_DIR = Path("../data/interim/")
 
+# ======================================================================
+# Global configuration defaults
+# ======================================================================
+
+
 # Parallel backend: "none", "processpool", or "mpi"
-PARALLEL_BACKEND_DEFAULT = "mpi"
+PARALLEL_BACKEND_DEFAULT = "processpool"
 
 # Worker count for process pool
 MAX_WORKERS = max(int(multiprocessing.cpu_count() * 2 / 3), 2)
@@ -102,6 +98,7 @@ DEFAULT_LOG_LEVEL = "INFO"
 OVERWRITE_EXISTING = True
 
 PROCESS_ALL_GROUPS_DEFAULT = False
+
 
 
 # ======================================================================
@@ -119,9 +116,8 @@ def setup_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
     """
     logging.basicConfig(
         level=getattr(logging, level.upper()),
-        format=f"%(asctime)s [RANK {RANK}] [%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
     )
-
 
 # ======================================================================
 # Time formatting
@@ -145,6 +141,9 @@ def format_hms(seconds: float) -> str:
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02d}h:{m:02d}m:{s:02d}s"
+
+
+
 
 
 # ======================================================================
@@ -228,7 +227,7 @@ def build_output_filename(path: Path, region_token: str) -> str:
     Notes
     -----
     Input:  dataset_region_uid_year_month.grib
-    Output: dataset_REGIONTOKEN_uid_year_month.parquet
+    Output: dataset_region_uid_year_month.parquet
     """
     t = parse_grib_name(path)
     return f"{t['dataset']}_{region_token}_{t['uid']}_{t['year']}_{t['month']}.parquet"
@@ -284,70 +283,58 @@ def scan_parameters(path: Path) -> List[Dict]:
                     pid = codes_get(gid, "paramId")
                     if isinstance(sn, bytes):
                         sn = sn.decode("utf-8")
-                    params[int(pid)] = {"paramId": int(pid), "shortName": str(sn)}
+                    params[int(pid)] = {"paramId": int(pid), "shortName": sn}
                 finally:
                     codes_release(gid)
 
-    except Exception:  # noqa: BLE001
+    except Exception:
         logging.exception("Error scanning parameters: %s", path)
 
     return list(params.values())
 
 
-def verify_variable_consistency_sequential(
-    files: List[Path],
-    reference_shortnames: List[str],
-    reference_file_name: str,
-) -> None:
+def verify_variable_consistency(files: List[Path], reference: Set[str]) -> None:
     """
-    Sequential variable consistency check with per-file logs.
+    Log any GRIB files whose variable set differs from a reference set.
 
     Parameters
     ----------
     files : list of Path
-    reference_shortnames : list of str
-    reference_file_name : str
+    reference : set of str
+        Set of shortNames expected.
+
+    Notes
+    -----
+    This logs inconsistencies but does NOT stop execution.
     """
-    ref_set = set(reference_shortnames)
+    logging.info(f"Checking variable consistency across {len(files)} files...")
+
+    # --- Build reference set from first file ---
+    # Each parameter dict must have "shortName"
+    reference_file = files[0]
+    reference = {p["shortName"] for p in scan_parameters(reference_file)}
+
     mismatches: Dict[str, Dict[str, List[str]]] = {}
 
-    logging.info(
-        "Checking variable consistency across %d files sequentially...",
-        len(files),
-    )
-
+    # --- Compare each file to reference ---
     for f in files:
         vars_this = {p["shortName"] for p in scan_parameters(f)}
-        missing = sorted(ref_set - vars_this)
-        extra = sorted(vars_this - ref_set)
 
-        if not missing and not extra:
-            logging.info(
-                "OK: %s — variables match reference (%d vars).",
-                f.name,
-                len(ref_set),
-            )
-        else:
-            logging.warning(
-                "MISMATCH: %s — missing=%s extra=%s",
-                f.name,
-                missing,
-                extra,
-            )
-            mismatches[f.name] = {"missing": missing, "extra": extra}
+        if vars_this != reference:
+            missing = sorted(reference - vars_this)
+            extra = sorted(vars_this - reference)
 
-    if not mismatches:
-        logging.info(
-            "Variable consistency check complete — all %d files share the "
-            "same shortName set as %s",
-            len(files),
-            reference_file_name,
-        )
-    else:
+            mismatches[f.name] = {
+                "missing": missing,
+                "extra": extra,
+            }
+
+    # --- Summary ---
+    if mismatches:
         logging.warning(
-            "Variable consistency check complete — %d file(s) differ from reference %s",
+            "Variable consistency check complete — %d files differ from %s",
             len(mismatches),
-            reference_file_name,
+            reference_file.name,
         )
         for fname, diff in mismatches.items():
             logging.warning("  %s:", fname)
@@ -355,92 +342,11 @@ def verify_variable_consistency_sequential(
                 logging.warning("    Missing: %s", ", ".join(diff["missing"]))
             if diff["extra"]:
                 logging.warning("    Extra:   %s", ", ".join(diff["extra"]))
-
-
-def verify_variable_consistency_mpi(
-    files: List[Path],
-    reference_shortnames: List[str],
-    reference_file_name: str,
-) -> None:
-    """
-    MPI-based variable consistency check with per-file logs (Mode A).
-
-    Each file is assigned to exactly one rank (i % SIZE == RANK).
-    All ranks log their own OK / MISMATCH status.
-    Rank 0 aggregates mismatches and prints a final summary.
-
-    Parameters
-    ----------
-    files : list of Path
-    reference_shortnames : list of str
-    reference_file_name : str
-    """
-    if not MPI_ENABLED:
-        raise RuntimeError("verify_variable_consistency_mpi called without MPI.")
-
-    ref_set = set(reference_shortnames)
-    total = len(files)
-
-    if RANK == 0:
+    else:
         logging.info(
-            "Checking variable consistency across %d files using MPI (%d ranks)...",
-            total,
-            SIZE,
+            f"Variable consistency check complete — all {len(files)-1} other files match {reference_file.name}",
         )
 
-    local_mismatches: Dict[str, Dict[str, List[str]]] = {}
-
-    for idx, f in enumerate(files):
-        if idx % SIZE != RANK:
-            continue
-
-        vars_this = {p["shortName"] for p in scan_parameters(f)}
-        missing = sorted(ref_set - vars_this)
-        extra = sorted(vars_this - ref_set)
-
-        if not missing and not extra:
-            logging.info(
-                "OK: %s — variables match reference (%d vars).",
-                f.name,
-                len(ref_set),
-            )
-        else:
-            logging.warning(
-                "MISMATCH: %s — missing=%s extra=%s",
-                f.name,
-                missing,
-                extra,
-            )
-            local_mismatches[f.name] = {"missing": missing, "extra": extra}
-
-    # Gather all mismatches at rank 0
-    all_mismatches = COMM.gather(local_mismatches, root=0)  # type: ignore[arg-type]
-    COMM.Barrier()
-
-    if RANK == 0:
-        combined: Dict[str, Dict[str, List[str]]] = {}
-        for d in all_mismatches:
-            combined.update(d)
-
-        if not combined:
-            logging.info(
-                "Variable consistency check complete — all %d files share the "
-                "same shortName set as %s",
-                total,
-                reference_file_name,
-            )
-        else:
-            logging.warning(
-                "Variable consistency check complete — %d file(s) differ from reference %s",
-                len(combined),
-                reference_file_name,
-            )
-            for fname, diff in combined.items():
-                logging.warning("  %s:", fname)
-                if diff["missing"]:
-                    logging.warning("    Missing: %s", ", ".join(diff["missing"]))
-                if diff["extra"]:
-                    logging.warning("    Extra:   %s", ", ".join(diff["extra"]))
 
 
 # ======================================================================
@@ -510,9 +416,7 @@ def load_grib_to_xarray(path: Path, shortnames: List[str]) -> xr.Dataset:
     xr.Dataset
     """
     datasets = [open_single_variable_dataset(path, sn) for sn in shortnames]
-    merged = xr.merge(
-        datasets, combine_attrs="override", compat="override", join="outer"
-    )
+    merged = xr.merge(datasets, combine_attrs="override", compat="override", join="outer")
 
     for ds in datasets:
         ds.close()
@@ -553,6 +457,7 @@ def process_one_grib(
     """
     start = time.time()
 
+    year, month = parse_year_month(path)
     out_name = build_output_filename(path, region_token)
     out_path = output_dir / out_name
 
@@ -597,6 +502,24 @@ def run_sequential(
 ) -> List[float]:
     """
     Run processing sequentially.
+
+    Parameters
+    ----------
+    files : List[Path]
+        List of Paths to GRIB files.
+    mask_parquet : Path
+        Path to mask parquet file.
+    var_shortnames : List[str]
+        Variables to extract.
+    region_token : str
+        Uppercase region token.
+    output_dir : Path
+        Output directory for monthly parquet files.
+
+    Returns
+    -------
+    List[float]
+        Processing times for each file.
     """
     return [
         process_one_grib(f, mask_parquet, var_shortnames, region_token, output_dir)
@@ -607,7 +530,18 @@ def run_sequential(
 def _worker(args) -> float:
     """
     Worker function for process pool.
+
+    Parameters
+    ----------
+    args : tuple
+        (Path, Path, List[str], str, Path)
+
+    Returns
+    -------
+    float
+        Processing time for the file.
     """
+
     (f, mask_parquet, var_shortnames, region_token, output_dir) = args
     setup_logging("INFO")
     return process_one_grib(f, mask_parquet, var_shortnames, region_token, output_dir)
@@ -622,9 +556,26 @@ def run_processpool(
 ) -> List[float]:
     """
     Run processing using a process pool.
+
+    Parameters
+    ----------
+    files : List[Path]
+        List of Paths to GRIB files.
+    mask_parquet : Path
+        Path to mask parquet file.
+    var_shortnames : List[str]
+        Variables to extract.
+    region_token : str
+        Uppercase region token.
+    output_dir : Path
+        Output directory for monthly parquet files.
+
+    Returns
+    -------
+    List[float]
+        Processing times for each file.
     """
     from concurrent.futures import ProcessPoolExecutor
-
     args = [
         (f, mask_parquet, var_shortnames, region_token, output_dir)
         for f in files
@@ -643,22 +594,42 @@ def run_mpi(
     """
     Run processing using MPI.
 
-    Each file is assigned to exactly one rank (i % SIZE == RANK).
-    """
-    if not MPI_ENABLED:
-        raise RuntimeError("MPI backend selected but mpi4py is not available.")
+    Parameters
+    ----------
+    files : List[Path]
+        List of Paths to GRIB files.
+    mask_parquet : Path
+        Path to mask parquet file.
+    var_shortnames : List[str]
+        Variables to extract.
+    region_token : str
+        Uppercase region token.
+    output_dir : Path
+        Output directory for monthly parquet files.
 
-    local_times: List[float] = []
+    Returns
+    -------
+    List[float]
+        Processing times for each file (only on rank 0).
+    """
+    if MPI is None:
+        raise RuntimeError("mpi4py not available.")
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    local_times = []
     for i, f in enumerate(files):
-        if i % SIZE == RANK:
+        if i % size == rank:
             t = process_one_grib(f, mask_parquet, var_shortnames, region_token, output_dir)
             local_times.append(t)
 
-    COMM.Barrier()
-    all_times = COMM.gather(local_times, root=0)
-    COMM.Barrier()
+    comm.Barrier()
+    all_times = comm.gather(local_times, root=0)
+    comm.Barrier()
 
-    if RANK == 0:
+    if rank == 0:
         return [t for sub in all_times for t in sub]
     return []
 
@@ -676,6 +647,25 @@ def select_groups(
 ) -> Dict[Tuple[str, str, str], List[Path]]:
     """
     Select appropriate GRIB groups based on filters and recency.
+
+    Parameters
+    ----------
+    groups : dict
+        (dataset, coords, uid) → list of files
+    dataset, coords, uid : str or None
+        Optional filters
+    coords: str or None
+        Optional filter
+    uid : str or None
+        Optional filter
+    process_all : bool
+        If True and filters not given, process all groups.
+        Else: pick the most recent group.
+
+    Returns
+    -------
+    dict
+        Filtered group(s)
     """
     # Apply filters
     if dataset or coords or uid:
@@ -701,6 +691,18 @@ def select_groups(
     logging.warning("Multiple groups found — selecting the most recent.")
 
     def newest_mtime(item: Tuple[Tuple[str, str, str], List[Path]]) -> float:
+        """
+        Return the newest modification time among a group's files.
+
+        Parameters
+        ----------
+        item : tuple
+            (key, list of files)
+        Returns
+        -------
+        float
+            Newest modification time.
+        """
         _, files = item
         return max(f.stat().st_mtime for f in files)
 
@@ -708,238 +710,186 @@ def select_groups(
     return {selected[0]: selected[1]}
 
 
-def main(args) -> None:
+def main(args):
+
     overall_start = time.time()
     setup_logging(args.log)
 
-    if RANK == 0:
-        logging.info("==================================================")
-        logging.info("Running step2a_mask_and_process_grib.py (MPI path)" if args.backend == "mpi"
-                     else "Running step2a_mask_and_process_grib.py")
-        logging.info("==================================================")
-        logging.info("Configuration used:")
-        logging.info("\t\tGRIB source directory : %s", args.grib_dir)
-        logging.info("\t\tMask parquet          : %s", args.mask_parquet)
-        logging.info("\t\tMask metadata         : %s", args.mask_meta)
-        logging.info("\t\tOutput directory      : %s", args.output_dir)
-        logging.info("\t\tParallel backend      : %s", args.backend)
-        logging.info("\t\tOverwrite existing    : %s", OVERWRITE_EXISTING)
-        logging.info("\t\tProcess all groups    : %s", args.process_all_groups)
-        if args.backend == "mpi":
-            logging.info("\t\tMPI world size        : %d", SIZE)
-        logging.info("==================================================")
-        logging.info("Starting processing...")
+    logging.info("==================================================")
+    logging.info("Running step2a_mask_and_process_grib.py")
+    logging.info("This script will filter geospatial grid data according to a precomputed mask and convert the original grib files to parquet format.")
+    logging.info("==================================================")
+    logging.info("Configuration used:")
+    logging.info(f"\t\tGRIB source directory : {args.grib_dir}")
+    logging.info(f"\t\tMask parquet : {args.mask_parquet}")
+    logging.info(f"\t\tMask metadata : {args.mask_meta}")
+    logging.info(f"\t\tOutput directory : {args.output_dir}")
+    logging.info(f"\t\tParallel backend : {args.backend}")
+    logging.info(f"\t\tOverwrite existing : {OVERWRITE_EXISTING}")
+    logging.info(f"\t\tProcess all groups : {args.process_all_groups}")
+    logging.info("==================================================")
+    logging.info("Starting processing...")
+
 
     # --------------------------------------------------------------
-    # 1. Rank 0: discover files, groups, mask metadata, reference vars
+    # Load and validate GRIB directory
     # --------------------------------------------------------------
-    if RANK == 0:
-        if not args.grib_dir.exists():
-            raise FileNotFoundError(f"GRIB directory does not exist: {args.grib_dir}")
+    if not args.grib_dir.exists():
+        raise FileNotFoundError(f"GRIB directory does not exist: {args.grib_dir}")
 
-        grib_files = sorted(args.grib_dir.glob("*.grib"))
-        if not grib_files:
-            raise RuntimeError(f"No .grib files found in {args.grib_dir}")
-        logging.info("Found [%d] GRIB files in [%s].", len(grib_files), args.grib_dir)
+    grib_files = sorted(args.grib_dir.glob("*.grib"))
+    if not grib_files:
+        raise RuntimeError(f"No .grib files found in {args.grib_dir}")
+    logging.info(
+        f"Found [{len(grib_files)}] GRIB files in [{args.grib_dir}]."
+    )
 
-        logging.info("Grouping GRIB files by (dataset, coords, uid)...")
-        all_groups = group_grib_files_by_triplet(grib_files)
 
-        logging.info("Detected %d GRIB groups in %s:", len(all_groups), args.grib_dir)
-        for (dataset, coords, uid), filelist in all_groups.items():
-            logging.info("Grouping characteristics:")
-            logging.info("\t\tDataset: [%s]", dataset)
-            logging.info("\t\tCoordinates: [%s]", coords)
-            logging.info("\t\tUID: [%s]", uid)
-            logging.info("\t\tNumber of files: %d", len(filelist))
+    # --------------------------------------------------------------
+    # Group GRIB files by (dataset, coords, uid)
+    # --------------------------------------------------------------
 
-        groups = select_groups(
-            all_groups,
-            dataset=args.dataset,
-            coords=args.coords,
-            uid=args.uid,
-            process_all=args.process_all_groups,
+    logging.info("Grouping GRIB files by (dataset, coords, uid)...")
+
+    all_groups = group_grib_files_by_triplet(grib_files)
+
+    logging.info(f"Detected {len(all_groups)} GRIB groups in {args.grib_dir}:")
+    for (dataset, coords, uid), filelist in all_groups.items():
+        logging.info(f"Grouping characteristics:")
+        logging.info(f"\t\tDataset: [{dataset}]")
+        logging.info(f"\t\tCoordinates: [{coords}]")
+        logging.info(f"\t\tUID: [{uid}]")
+        logging.info(f"\t\tNumber of files: {len(filelist)}")
+
+    # Apply filters + recency selection
+    groups = select_groups(
+        all_groups,
+        dataset=args.dataset,
+        coords=args.coords,
+        uid=args.uid,
+        process_all=args.process_all_groups,
+    )
+
+    logging.info(f"After filtering, [{len(groups)}] group(s) will now be processed:")
+    for (dataset, coords, uid), filelist in groups.items():
+        logging.info(
+            f'\t\t[{dataset}_{coords}_{uid}] with [{len(filelist)}] files)'
         )
 
-        logging.info("After filtering, [%d] group(s) will now be processed:", len(groups))
-        for (dataset, coords, uid), filelist in groups.items():
-            logging.info(
-                "\t\t[%s_%s_%s] with [%d] files)",
-                dataset,
-                coords,
-                uid,
-                len(filelist),
-            )
+    # --------------------------------------------------------------
+    # Load explicit mask metadata + mask parquet
+    # --------------------------------------------------------------
+    if not args.mask_meta.exists():
+        raise FileNotFoundError(f"Mask metadata not found: {args.mask_meta}")
 
-        # Mask + metadata
-        if not args.mask_meta.exists():
-            raise FileNotFoundError(f"Mask metadata not found: {args.mask_meta}")
-        if not args.mask_parquet.exists():
-            raise FileNotFoundError(f"Mask parquet not found: {args.mask_parquet}")
+    if not args.mask_parquet.exists():
+        raise FileNotFoundError(f"Mask parquet not found: {args.mask_parquet}")
 
-        with open(args.mask_meta, "r", encoding="utf-8") as f:
-            meta = json.load(f)
+    with open(args.mask_meta, "r", encoding="utf-8") as f:
+        meta = json.load(f)
 
-        region_token = str(meta.get("region_token", "REGION")).upper()
-        logging.info("\t\tUsing region token: %s", region_token)
-
-        # Reference variables from first file in selected groups
-        first_file = next(iter(groups.values()))[0]
-        params = scan_parameters(first_file)
-        shortnames = sorted({p["shortName"] for p in params})
-        logging.info("\t\tWith variables : %s", shortnames)
-
-        # Flatten selected groups → files_to_process
-        files_to_process: List[Path] = []
-        for _, flist in groups.items():
-            files_to_process.extend(sorted(flist))
-
-        # For consistency check, use exactly the selected files
-        files_for_consistency = files_to_process
-
-    else:
-        # Non-root ranks: placeholders, will receive via MPI broadcast
-        groups = None
-        meta = None
-        region_token = None
-        first_file = None
-        shortnames = None
-        files_to_process = None
-        files_for_consistency = None
+    region_token = str(meta.get("region_token", "REGION")).upper()
+    logging.info("\t\tUsing region token: %s", region_token)
 
     # --------------------------------------------------------------
-    # 2. Broadcast essentials to all ranks (MPI path)
+    # Reference variables from first file
     # --------------------------------------------------------------
-    if args.backend == "mpi" and MPI_ENABLED:
-        region_token = COMM.bcast(region_token, root=0)
-        shortnames = COMM.bcast(shortnames, root=0)
-        files_to_process = COMM.bcast(files_to_process, root=0)
-        files_for_consistency = COMM.bcast(files_for_consistency, root=0)
-        first_file_name = COMM.bcast(
-            first_file.name if RANK == 0 else None,
-            root=0,
-        )
-    else:
-        # Non-MPI: everything only on rank 0
-        first_file_name = first_file.name if RANK == 0 else None
-
-    # Guard: if backend is mpi but mpi not enabled
-    if args.backend == "mpi" and not MPI_ENABLED:
-        if RANK == 0:
-            raise RuntimeError("MPI backend requested but mpi4py/MPI not available.")
+    first_file = next(iter(groups.values()))[0]
+    params = scan_parameters(first_file)
+    shortnames = sorted({p["shortName"] for p in params})
+    logging.info(f"\t\tWith variables : {shortnames}")
 
     # --------------------------------------------------------------
-    # 3. Variable consistency check
+    # Verify consistency across all files
     # --------------------------------------------------------------
-    if args.backend == "mpi" and MPI_ENABLED:
-        # MPI-based per-file logs
-        verify_variable_consistency_mpi(
-            files_for_consistency,
-            shortnames,
-            reference_file_name=first_file_name,
-        )
-    else:
-        # Sequential check on rank 0 only
-        if RANK == 0:
-            verify_variable_consistency_sequential(
-                files_for_consistency,
-                shortnames,
-                reference_file_name=first_file_name,
-            )
-
-    # Barrier after consistency check (MPI only)
-    if args.backend == "mpi" and MPI_ENABLED:
-        COMM.Barrier()
+    verify_variable_consistency(grib_files, set(shortnames))
 
     # --------------------------------------------------------------
-    # 4. Process files according to backend
+    # Flatten all selected groups into list of files
     # --------------------------------------------------------------
-    durations: List[float] = []
+    files_to_process = []
+    for _, flist in groups.items():
+        files_to_process.extend(sorted(flist))
 
+    logging.info("Processing %d GRIB files.", len(files_to_process))
+
+    # --------------------------------------------------------------
+    # Dispatch to backend
+    # --------------------------------------------------------------
     if args.backend == "none":
-        if RANK == 0:
-            logging.info("Processing %d GRIB files sequentially.", len(files_to_process))
-            durations = run_sequential(
-                files_to_process,
-                args.mask_parquet,
-                shortnames,
-                region_token,
-                args.output_dir,
-            )
-
+        durations = run_sequential(
+            files_to_process, args.mask_parquet, shortnames,
+            region_token, args.output_dir
+        )
     elif args.backend == "processpool":
-        if RANK == 0:
-            logging.info("Processing %d GRIB files with process pool.", len(files_to_process))
-            durations = run_processpool(
-                files_to_process,
-                args.mask_parquet,
-                shortnames,
-                region_token,
-                args.output_dir,
-            )
-
+        durations = run_processpool(
+            files_to_process, args.mask_parquet, shortnames,
+            region_token, args.output_dir
+        )
     elif args.backend == "mpi":
-        logging.info("Processing %d GRIB files with MPI.", len(files_to_process))
         durations = run_mpi(
-            files_to_process,
-            args.mask_parquet,
-            shortnames,
-            region_token,
-            args.output_dir,
+            files_to_process, args.mask_parquet, shortnames,
+            region_token, args.output_dir
         )
     else:
-        if RANK == 0:
-            raise ValueError(f"Unknown backend: {args.backend}")
+        raise ValueError(f"Unknown backend: {args.backend}")
 
     # --------------------------------------------------------------
-    # 5. Final summary (rank 0 only)
+    # Summary
     # --------------------------------------------------------------
-    if RANK == 0:
-        total = sum(durations)
-        n = sum(1 for d in durations if d > 0)
-        avg = total / n if n > 0 else 0.0
+    total = sum(durations)
+    n = sum(1 for d in durations if d > 0)
+    avg = total / n if n > 0 else 0.0
 
-        total_files = n
-        cpu_time_total = total
-        cpu_time_avg = avg
-        wall_time_total = time.time() - overall_start
+    # --------------------------------------------------------------
+    # FINAL SUMMARY
+    # --------------------------------------------------------------
+    total_files = sum(1 for d in durations if d > 0)
+    cpu_time_total = sum(durations)
+    cpu_time_avg = cpu_time_total / total_files if total_files else 0.0
+    wall_time_total = time.time() - overall_start
 
-        cpu_total_fmt = format_hms(cpu_time_total)
-        cpu_avg_fmt = format_hms(cpu_time_avg)
-        wall_total_fmt = format_hms(wall_time_total)
+    # Format times
+    cpu_total_fmt = format_hms(cpu_time_total)
+    cpu_avg_fmt = format_hms(cpu_time_avg)
+    wall_total_fmt = format_hms(wall_time_total)
 
-        group_keys = ["_".join(map(str, k)) for k in groups.keys()]
-        group_str = ", ".join(group_keys)
+    # Extract grouping key(s)
+    group_keys = list(groups.keys())
+    group_str = ", ".join([f"{g[0]}_{g[1]}_{g[2]}" for g in group_keys])
 
-        if args.backend == "processpool":
-            worker_count = MAX_WORKERS
-        elif args.backend == "mpi":
-            worker_count = SIZE
-        else:
-            worker_count = 1
+    # Determine worker count for summary
+    if args.backend == "processpool":
+        worker_count = MAX_WORKERS
+    elif args.backend == "mpi":
+        worker_count = MPI.COMM_WORLD.Get_size() if MPI is not None else 1
+    else:
+        worker_count = 1
 
-        logging.info("==================================================")
-        logging.info("PROCESS OVERVIEW")
-        logging.info("==================================================")
-        logging.info("INPUTS")
-        logging.info("--------------------------------------------------")
-        logging.info("\t\tSource directory : %s", args.grib_dir)
-        logging.info("\t\tOutput directory : %s", args.output_dir)
-        logging.info("\t\tMask parquet     : %s", args.mask_parquet)
-        logging.info("\t\tMask metadata    : %s", args.mask_meta)
-        logging.info("PROCESSING")
-        logging.info("--------------------------------------------------")
-        logging.info("\t\tGrouping key(s)  : %s", group_str)
-        logging.info("\t\tFiles processed  : [%d]", total_files)
-        logging.info("\t\tParallel backend : [%s]", args.backend)
-        logging.info("\t\tParallel workers : [%d]", worker_count)
-        logging.info("TIMINGS")
-        logging.info("--------------------------------------------------")
-        logging.info("\t\tAverage per file : %s", cpu_avg_fmt)
-        logging.info("\t\tCPU total time   : %s", cpu_total_fmt)
-        logging.info("\t\tTOTAL WALL TIME  : %s", wall_total_fmt)
-        logging.info("--------------------------------------------------")
-        logging.info("Processing complete.")
+    logging.info("==================================================")
+    logging.info("PROCESS OVERVIEW")
+    logging.info("==================================================")
+    logging.info("INPUTS")
+    logging.info("--------------------------------------------------")
+    logging.info(f"\t\tSource directory : {args.grib_dir}")
+    logging.info(f"\t\tOutput directory : {args.output_dir}")
+    logging.info(f"\t\tMask parquet : {args.mask_parquet}")
+    logging.info(f"\t\tMask metadata : {args.mask_meta}")
+    logging.info("PROCESSING")
+    logging.info("--------------------------------------------------")
+    logging.info(f"\t\tGrouping key(s) : {group_str}")
+    logging.info(f"\t\tFiles processed : [{total_files}]")
+    logging.info(f"\t\tParallel backend : [{args.backend}]")
+    logging.info(f"\t\tParallel workers : [{worker_count}]")
+    logging.info("TIMINGS")
+    logging.info("--------------------------------------------------")
+    logging.info(f"\t\tAverage per file : {cpu_avg_fmt}")
+    logging.info(f"\t\tCPU total time : {cpu_total_fmt}")
+    logging.info(f"\t\tTOTAL WALL TIME : {wall_total_fmt}")
+    logging.info("--------------------------------------------------")
+    logging.info("--------------------------------------------------")
+    logging.info("--------------------------------------------------")
+    logging.info("Processing complete.")
 
 
 # ======================================================================
@@ -953,22 +903,22 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--grib-dir", type=Path, default=GRIB_DIR,
-        help="Directory containing monthly ERA5 .grib files.",
+        help="Directory containing monthly ERA5 .grib files."
     )
 
     parser.add_argument(
         "--output-dir", type=Path, default=OUTPUT_DIR,
-        help="Directory to write output monthly Parquet files.",
+        help="Directory to write output monthly Parquet files."
     )
 
     parser.add_argument(
         "--mask-parquet", type=Path, default=MASK_PARQUET,
-        help="Path to mask parquet file.",
+        help="Path to mask parquet file."
     )
 
     parser.add_argument(
         "--mask-meta", type=Path, default=MASK_META,
-        help="Path to mask metadata JSON file.",
+        help="Path to mask metadata JSON file."
     )
 
     # ------------ Optional filters ------------
@@ -981,24 +931,20 @@ if __name__ == "__main__":
         "--process-all-groups",
         action="store_true",
         default=PROCESS_ALL_GROUPS_DEFAULT,
-        help=(
-            "If multiple GRIB groups exist and no filters provided, process ALL. "
-            "Default: only process the most recent group."
-        ),
+        help="If multiple GRIB groups exist and no filters provided, process ALL. "
+             "Default: only process the most recent group."
     )
 
     # ------------ Backend & logging ------------
     parser.add_argument(
-        "--backend",
-        type=str,
+        "--backend", type=str,
         choices=["none", "processpool", "mpi"],
-        default=PARALLEL_BACKEND_DEFAULT,
+        default=PARALLEL_BACKEND_DEFAULT
     )
     parser.add_argument(
-        "--log",
-        type=str,
+        "--log", type=str,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        default=DEFAULT_LOG_LEVEL,
+        default=DEFAULT_LOG_LEVEL
     )
 
     args = parser.parse_args()

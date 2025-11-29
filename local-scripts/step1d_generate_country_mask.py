@@ -775,47 +775,16 @@ def main() -> None:
             DEFAULT_MAX_WORKERS,
             args.parallel_chunk_size,
         )
-
         chunks: List[np.ndarray] = [
             cell_polys[i:i + args.parallel_chunk_size]
             for i in range(0, n_cells, args.parallel_chunk_size)
         ]
-        n_chunks = len(chunks)
 
-        logging.info("Parallel area computation: %d chunks × %d workers", n_chunks, DEFAULT_MAX_WORKERS)
-
-        results = []
-        start_time = time.time()
-
-        # create pool
         with multiprocessing.Pool(processes=DEFAULT_MAX_WORKERS) as pool:
-
-            # apply_async launcher
-            async_results = [
-                pool.apply_async(compute_fraction_area, args=(chunk, region_geom))
-                for chunk in chunks
-            ]
-
-            # progress loop
-            for i, ar in enumerate(async_results, start=1):
-                f, a = ar.get()   # wait for chunk to complete
-                results.append((f, a))
-
-                elapsed = time.time() - start_time
-                pct = (i / n_chunks) * 100
-                avg_per_chunk = elapsed / i
-                est_total = avg_per_chunk * n_chunks
-                est_remaining = est_total - elapsed
-
-                logging.info(
-                    "Chunk %d/%d complete (%.1f%%)  |  elapsed: %.1fs  |  ETA: %.1fs",
-                    i,
-                    n_chunks,
-                    pct,
-                    elapsed,
-                    max(0.0, est_remaining),
-                )
-
+            results = pool.starmap(
+                compute_fraction_area,
+                [(chunk, region_geom) for chunk in chunks],
+            )
 
         frac_vals = np.concatenate([f for f, _ in results])
         cell_areas = np.concatenate([a for _, a in results])
